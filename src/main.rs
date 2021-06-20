@@ -71,11 +71,14 @@ impl EventHandler for Handler {
         // TODO: Maybe store this in a map too? Though it is quite easy here..
         let channel_lang = &channel_name[5..].to_uppercase();
 
+        // Colonialism in action
+        let default_lang = String::from("EN");
+
         // We might not want to translate into the channel's language though. If
         // we are replying to someone whose message wss subsequently translated
         // (because they are talking in the channel's language), we should
         // translate into the language of the replied-to message
-        let mut target_lang = String::from(channel_lang);
+        let mut target_lang = String::from(default_lang);
 
         // Get a reference to the replied-to message
         let reply_to = match msg.referenced_message.clone() {
@@ -112,7 +115,7 @@ impl EventHandler for Handler {
         {
             let mut translations = translations_lock.write().await;
             let source_lang = translation.detected_source_language.clone().to_uppercase();
-            translations.entry(msg.id.clone()).or_insert(source_lang.clone());
+            translations.entry(msg.id.clone()).or_insert(channel_lang.clone());
         };
 
 
@@ -122,20 +125,17 @@ impl EventHandler for Handler {
         }
 
         if let Err(why) = msg.channel_id.send_message(&ctx.http, |f| {
-            let msg_ref = MessageReference::from(&msg.clone());
+            let mut msg_ref = MessageReference::from(&msg.clone());
 
-
-            // Here lies some code which was originally intended to
-            // conditionally attach the bot's reply to either the
-            // just-translated message, or the message which was replied-to by
-            // said message (whose language we have just translated back into)
-            // I decided that this was a bit confusing, but maybe the bot should
-            // be highlighting all messages in your language which were replies
-            // to you, since you might ignore them in favour of other
-            // highlighted messages otherwise...
-            // if reply_to != 0 {
-            //     msg_ref = MessageReference::from((channel.id().clone(), reply_to));
-            // }
+            // Here lies some code which conditionally attaches  the bot's reply
+            // to either the just-translated message, or the message which was
+            // replied-to by said message (whose language we have just
+            // translated back into).
+            // Not sure whether this is too confusing or not though, and you
+            // loee the "audit trail"
+            if reply_to != 0 {
+                msg_ref = MessageReference::from((channel.id().clone(), reply_to));
+            }
 
             f.reference_message(msg_ref).content(translation.text)
         }).await {
@@ -157,7 +157,7 @@ pub async fn translate_message (msg: String, language_code: String) -> Translati
     // Do the response with some very ugly chaining until we get the result.
     // TODO: Handle these errors gracefully.
     let response = reqwest::Client::new()
-        .post("https://api-free.deepl.com/v2/translate?auth_key=DEEPL_AUTH_KEY_HERE") // <- Create request builder
+        .post("https://api-free.deepl.com/v2/translate?auth_key=DEEPL_API_KEY") // <- Create request builder
         .header("User-Agent", "Actix-web")
         .form(&form_data)
         .send()
@@ -183,7 +183,7 @@ pub async fn translate_message (msg: String, language_code: String) -> Translati
 async fn main() {
 
     // TODO: Put this in a config file
-    let bot_token = "BOT TOKEN GOES HERE";
+    let bot_token = "DISCORD_BOT_TOKEN";
 
     // Make an authenticated http client to use with Serenity
     let http_client = serenity::http::client::Http::new_with_token(bot_token);
