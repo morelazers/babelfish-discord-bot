@@ -86,6 +86,7 @@ impl TypeMapKey for Translations {
 struct AppConfig {
     bot_token: String,
     bot_user_id: UserId,
+    deepl_api_key: String,
     aggregate_channel_id: ChannelId,
     source_channel_language: HashMap<ChannelId, String>,
     default_language: String,
@@ -208,7 +209,11 @@ impl EventHandler for Handler {
         println!("Translating to {}, then sending a message to channel {}", &target_message.target_language, target_message.target_channel_id);
 
         // Go do the translation with deepL
-        let translation = translate_message(msg.content.clone(), String::from(&target_message.target_language)).await;
+        let translation = translate_message(
+            msg.content.clone(),
+            String::from(&target_message.target_language),
+            &config.deepl_api_key
+        ).await;
 
         let past_translation = PastTranslation {
             language: channel_lang.clone(),
@@ -281,7 +286,7 @@ impl EventHandler for Handler {
 }
 
 // Actually do the translation HTTP request to DeepL
-pub async fn translate_message (msg: String, language_code: String) -> Translation {
+pub async fn translate_message (msg: String, language_code: String, api_key: &String) -> Translation {
 
     // Construct the body of the request
     let form_data = [("text", msg.clone()), ("target_lang", language_code.clone())];
@@ -289,7 +294,7 @@ pub async fn translate_message (msg: String, language_code: String) -> Translati
     // Do the response with some very ugly chaining until we get the result.
     // TODO: Handle these errors gracefully.
     let response = reqwest::Client::new()
-        .post("https://api-free.deepl.com/v2/translate?auth_key=1f5dae55-2c8f-70b9-6c9e-b95e2b80d2aa:fx") // <- Create request builder
+        .post(format!("https://api-free.deepl.com/v2/translate?auth_key={}", api_key)) // <- Create request builder
         .header("User-Agent", "Actix-web")
         .form(&form_data)
         .send()
@@ -320,12 +325,14 @@ async fn main() {
     settings.merge(config::File::with_name("Settings")).unwrap();
     let bot_token = settings.get_str("bot_token").unwrap();
     let bot_user_id: u64 = settings.get("bot_user_id").unwrap();
+    let deepl_api_key = settings.get_str("deepl_api_key").unwrap();
     let default_language = settings.get_str("default_language").unwrap();
     let aggregate_channel_id: u64 = settings.get("aggregate_channel_id").unwrap();
     let source_channel_language: HashMap<ChannelId, String> = settings.get("source_channel_language").unwrap();
 
     app_config.bot_token = bot_token.clone();
     app_config.bot_user_id = UserId::from(bot_user_id);
+    app_config.deepl_api_key = deepl_api_key.clone();
     app_config.default_language = default_language.clone();
     app_config.aggregate_channel_id = ChannelId::from(aggregate_channel_id);
     app_config.source_channel_language = source_channel_language.clone();
