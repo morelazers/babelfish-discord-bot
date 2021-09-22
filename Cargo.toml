@@ -10,7 +10,7 @@ edition = "2018"
 actix-rt = "2.2.0"
 actix-web = { version = "3", features=["openssl"] }
 awc = "2.0.3"
-# serenity = { version = "0.10.0", features = ["client"] }
+config = "0.11.0"
 serenity = {version = "0.10.0", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "http"] }
 futures = "0.3.14"
 serde = "1.0.126"

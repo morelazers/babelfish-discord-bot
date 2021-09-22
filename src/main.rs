@@ -1,3 +1,43 @@
+/**
+
+    Definitions:
+        - Source Channel: A channel which collects messages in an expected
+            language. The program expects to be configured with multiple Source
+            Channels, which are mapped to their expected language codes. The
+            language codes we use are those supported by deepl's API.
+            https://www.deepl.com/docs-api/translating-text/request/
+
+        - Source Message: A message in the Source Channel.
+
+        - Source Bot Message: A bot message posted into the Source Channel.
+
+        - Source Bot Reply: A reply to a Source Message by the Bot, always is
+            the result of an Aggregate Reply.
+
+        - Aggregate Channel: A channel into which translations of messages in
+            the Source Channels are posted.
+
+        - Aggregate Bot Message: A message posted into the Aggregate Channel by
+            the bot.
+
+        - Aggregate Reply: A reply in the Aggregate channel to an Aggregate Bot
+            Message.
+
+
+    V2:
+        - Messages which are translated by babelfish should be posted into a
+            configurable channel by the bot (this channel would likely be viewable
+            by admins of the server).
+        - A reply to the forwarded message should be translated back into the source
+            langauge, and posted back to the original channel by the bot, ensuring
+            that we denote the replier's name (such that they can be more easily
+            tagged?).
+
+
+*/
+
+
+
 // Data Storage
 use std::{collections::HashMap, sync::Arc};
 
@@ -7,12 +47,7 @@ use serde_json::{from_str};
 use reqwest;
 
 // Discord Client
-use serenity::{
-    async_trait,
-    client::{Context, EventHandler, ClientBuilder},
-    model::{channel::{Message, MessageReference},id::MessageId, gateway::Ready},
-    prelude::{RwLock,TypeMapKey}
-};
+use serenity::{async_trait, client::{Context, EventHandler, ClientBuilder}, model::{channel::{Message, MessageReference}, gateway::Ready, id::{MessageId, ChannelId, UserId}}, prelude::{RwLock,TypeMapKey}};
 
 // DeepL returns a Vec<Translation>, so we deserialise through two types, a
 // container (DeepLResponse) and an individual item (Translation)
@@ -25,13 +60,39 @@ pub struct Translation {
 struct DeepLResponse {
     translations: Vec<Translation>
 }
+#[derive(Deserialize, Debug, Clone)]
+struct PastTranslation {
+    channel_id: ChannelId,
+    message_id: MessageId,
+    language: String
+}
+struct BotMessage {
+    target_channel_id: ChannelId,
+    target_language: String,
+    target_reply_to_message: MessageId
+}
 
 // A map of MessageId => String
 struct Translations;
 
-// The thing we're storing is a rw-locked HashMap. wrapped in an Arc
+// The thing we're storing is a rw-locked HashMap. wrapped in an Arc for thread
+// safety
 impl TypeMapKey for Translations {
-    type Value = Arc<RwLock<HashMap<MessageId, String>>>;
+    type Value = Arc<RwLock<HashMap<MessageId, PastTranslation>>>;
+}
+
+// I would like this to be a config struct I guess?
+#[derive(Deserialize, Debug, Default, Clone)]
+struct AppConfig {
+    bot_token: String,
+    bot_user_id: UserId,
+    aggregate_channel_id: ChannelId,
+    source_channel_language: HashMap<ChannelId, String>,
+    default_language: String,
+}
+
+impl TypeMapKey for AppConfig {
+    type Value = Arc<AppConfig>;
 }
 
 struct Handler;
@@ -40,19 +101,31 @@ struct Handler;
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
 
-        // Don't reply to messages from self
-        // TODO: Factor this out into config?
-        if msg.author.id == 851154413207814204 {
+        // We don't need the RwLock on this value since we're not writing to the
+        // variable. It does not need to be "super" thread safe
+        let config = {
+            let data = ctx.data.read().await;
+            data.get::<AppConfig>().expect("something").clone()
+        };
+
+        println!("Got message from {:?}", msg.author.id);
+        // Don't care about messages from self.
+        if msg.author.id == config.bot_user_id {
+            println!("This is the bot, ignoring.");
             return
         }
 
-        // Check that our Channel's name starts with "intl-"
-        // TODO: Factor this out into config?
-        let channel = msg.channel_id.to_channel(&ctx.http).await.unwrap();
-        let channel_name = &channel.clone().guild().unwrap().name;
-        if !channel_name.contains("intl-") {
-            return
+        // If we have the channel id in the config map, we should get the
+        // source language here
+        let mut channel_lang = String::from("en-GB");
+        if config.source_channel_language.contains_key(&msg.channel_id) {
+            channel_lang = String::from(config.source_channel_language.get(&msg.channel_id).unwrap());
+            println!("Found message in channel {:?} with expected source language {}", msg.channel_id, channel_lang);
+        } else {
+            println!("The bot is not active in the channel with ID: {}", msg.channel_id);
         }
+
+        println!("Got a message in channel {}", &msg.channel_id);
 
         // Get a the thread-safe lock on the translations from the context's data store
         let translations_lock = {
@@ -64,27 +137,43 @@ impl EventHandler for Handler {
             // Wrapping the value in Arc means we can keep the data lock open
             // for minimal time
             data_read.get::<Translations>().expect("Expected something").clone()
-
         };
 
-        // Get the channel's language
-        // TODO: Maybe store this in a map too? Though it is quite easy here..
-        let channel_lang = &channel_name[5..].to_uppercase();
+        let default_language = &config.default_language;
 
-        // Colonialism in action
-        let default_lang = String::from("EN");
+        // Unless we discern otherwise, a message in this channel should be
+        // translated into the operator_language and result in an Aggregate Bot
+        // Message.
+        let mut target_message = BotMessage {
+            target_channel_id: ChannelId::from(config.aggregate_channel_id),
+            target_language: String::from(default_language),
+            // A reply to the BotMessage should result in the _next_ BotMessage
+            // replying to the original message!
+            target_reply_to_message: MessageId::from(msg.id)
+        };
 
-        // We might not want to translate into the channel's language though. If
-        // we are replying to someone whose message wss subsequently translated
-        // (because they are talking in the channel's language), we should
-        // translate into the language of the replied-to message
-        let mut target_lang = String::from(default_lang);
+        // We may however want to send a Source Bot Reply, so we should check
+        // that a little bit later
 
-        // Get a reference to the replied-to message
+        // Get a reference to the replied-to message (if any).
         let reply_to = match msg.referenced_message.clone() {
             Some(m) => m.id,
             None => MessageId::from(0)
         };
+
+        println!("This is a reply to message {}", reply_to);
+
+        // If the message we are replying to is an Aggregate Bot Message, then
+        // we are likely to want to send a Source Bot Reply as a result of the
+        // translation.
+
+        // Which means our data structure must contain both the Aggregate Bot
+        // and Source Bot message IDs.
+
+        // Source Message -> Aggregate Bot Message
+        // Source Reply -> Aggregate Bot Reply
+        // Aggregate Message -> Source Bot Message
+        // Aggregate Reply -> Source Bot Reply
 
         // Now we need to find out if the replied-to message has been translated
         // already. If it has, we'll translate back to its source language.
@@ -92,30 +181,46 @@ impl EventHandler for Handler {
         // it to overwrite the default target language which was derived from
         // the channel name
         {
-            let past_translations = translations_lock
-               .read()
-               .await;
+            let all_past_translations = translations_lock
+                .read()
+                .await;
 
-            let replying_to_source_lang = past_translations
+            let referenced_past_translation = all_past_translations
                 .get(&reply_to);
 
-            target_lang = match replying_to_source_lang {
-                Some(s) => s.clone(),
-                None => target_lang
+            target_message = match referenced_past_translation {
+                Some(s) => BotMessage {
+                    // Here is where we should be doing some work to find out
+                    // what we have just got a hold of.
+
+                    // The target channel ID is the inverse.
+                    // Source -> Aggregate
+                    // Aggregate -> Source
+                    target_channel_id: s.channel_id,
+                    target_language: s.language.clone(),
+                    target_reply_to_message: s.message_id
+                },
+                None => target_message
             };
+
         };
 
-        println!("Got reply to {}, translating to {}", &reply_to, &target_lang);
+        println!("Translating to {}, then sending a message to channel {}", &target_message.target_language, target_message.target_channel_id);
 
         // Go do the translation with deepL
-        let translation = translate_message(msg.content.clone(), String::from(&target_lang)).await;
+        let translation = translate_message(msg.content.clone(), String::from(&target_message.target_language)).await;
 
+        let past_translation = PastTranslation {
+            language: channel_lang.clone(),
+            channel_id: msg.channel_id,
+            message_id: msg.id
+        };
 
         // Now write this message's id to storage, keying its source language
         {
             let mut translations = translations_lock.write().await;
-            let source_lang = translation.detected_source_language.clone().to_uppercase();
-            translations.entry(msg.id.clone()).or_insert(channel_lang.clone());
+            translations.entry(msg.id.clone()).or_insert(past_translation.clone());
+            println!("Stored the message {:?} with key {}", past_translation.clone(), msg.id.clone());
         };
 
 
@@ -124,8 +229,9 @@ impl EventHandler for Handler {
             return
         }
 
-        if let Err(why) = msg.channel_id.send_message(&ctx.http, |f| {
-            let mut msg_ref = MessageReference::from(&msg.clone());
+        let sent_message_result = target_message.target_channel_id.send_message(&ctx.http, |f| {
+
+            let mut msg_ref = MessageReference::from(&msg);
 
             // Here lies some code which conditionally attaches  the bot's reply
             // to either the just-translated message, or the message which was
@@ -134,12 +240,38 @@ impl EventHandler for Handler {
             // Not sure whether this is too confusing or not though, and you
             // loee the "audit trail"
             if reply_to != 0 {
-                msg_ref = MessageReference::from((channel.id().clone(), reply_to));
+                println!("This message is a reply to {} in the channel {}", target_message.target_reply_to_message, target_message.target_channel_id);
+                msg_ref = MessageReference::from((target_message.target_channel_id, target_message.target_reply_to_message));
             }
 
-            f.reference_message(msg_ref).content(translation.text)
-        }).await {
+            // We want to reply to a message if: this is the channel that the
+            // original message was typed in. So if the message we're sending
+            // right now is a return translation
+            let content = format!("{} (from: {})", translation.text, msg.clone().author.name);
+            let mut message_builder = f.content(content);
+            if reply_to != 0 {
+                message_builder = message_builder.reference_message(msg_ref);
+            }
+            message_builder
+        }).await;
+
+        if let Err(why) = sent_message_result {
             println!("Error sending message: {:?}", why);
+        } else {
+            let sent_message = sent_message_result.unwrap();
+            // We need to write this message to the translations map, so we know
+            // the language that we came from (and thus will know what language
+            // to return to).
+            {
+                let mut translations = translations_lock.write().await;
+                let translation = PastTranslation {
+                    language: translation.detected_source_language.clone(),
+                    channel_id: msg.channel_id,
+                    message_id: msg.id
+                };
+                translations.entry(sent_message.id.clone()).or_insert(translation.clone());
+                println!("Stored the message {:?} with key {}", translation.clone(), sent_message.id.clone());
+            };
         }
     }
 
@@ -152,12 +284,12 @@ impl EventHandler for Handler {
 pub async fn translate_message (msg: String, language_code: String) -> Translation {
 
     // Construct the body of the request
-    let form_data = [("text", msg), ("target_lang", language_code.clone())];
+    let form_data = [("text", msg.clone()), ("target_lang", language_code.clone())];
 
     // Do the response with some very ugly chaining until we get the result.
     // TODO: Handle these errors gracefully.
     let response = reqwest::Client::new()
-        .post("https://api-free.deepl.com/v2/translate?auth_key=DEEPL_API_KEY") // <- Create request builder
+        .post("https://api-free.deepl.com/v2/translate?auth_key=1f5dae55-2c8f-70b9-6c9e-b95e2b80d2aa:fx") // <- Create request builder
         .header("User-Agent", "Actix-web")
         .form(&form_data)
         .send()
@@ -170,6 +302,7 @@ pub async fn translate_message (msg: String, language_code: String) -> Translati
     // DeepL gives us back a vector of possible translations, depending on the
     // language that it thinks the message is written in. We only care about
     // returning the first one.
+    println!("Posted message \"{}\" to DeepL with target language {} and got back {}", msg.clone(), language_code.clone(), &response.clone());
     let translated_message: DeepLResponse = from_str(&response).unwrap();
     let first_translation = translated_message.translations.first().unwrap();
     if first_translation.detected_source_language == language_code.clone() {
@@ -182,11 +315,25 @@ pub async fn translate_message (msg: String, language_code: String) -> Translati
 #[actix_rt::main]
 async fn main() {
 
-    // TODO: Put this in a config file
-    let bot_token = "DISCORD_BOT_TOKEN";
+    let mut app_config: AppConfig = Default::default();
+    let mut settings = config::Config::default();
+    settings.merge(config::File::with_name("Settings")).unwrap();
+    let bot_token = settings.get_str("bot_token").unwrap();
+    let bot_user_id: u64 = settings.get("bot_user_id").unwrap();
+    let default_language = settings.get_str("default_language").unwrap();
+    let aggregate_channel_id: u64 = settings.get("aggregate_channel_id").unwrap();
+    let source_channel_language: HashMap<ChannelId, String> = settings.get("source_channel_language").unwrap();
+
+    app_config.bot_token = bot_token.clone();
+    app_config.bot_user_id = UserId::from(bot_user_id);
+    app_config.default_language = default_language.clone();
+    app_config.aggregate_channel_id = ChannelId::from(aggregate_channel_id);
+    app_config.source_channel_language = source_channel_language.clone();
+
+    println!("App's config: {:?}", app_config);
 
     // Make an authenticated http client to use with Serenity
-    let http_client = serenity::http::client::Http::new_with_token(bot_token);
+    let http_client = serenity::http::client::Http::new_with_token(&app_config.bot_token);
 
     // Instantiate Serenity with the bot token
     let mut discord_client = ClientBuilder::new_with_http(http_client)
@@ -205,6 +352,7 @@ async fn main() {
         // Arc<RwLock<HashMap<MessageId, String>>>
         // So, we have to insert the same type to it.
         data.insert::<Translations>(Arc::new(RwLock::new(HashMap::default())));
+        data.insert::<AppConfig>(Arc::new(app_config));
     }
 
     // Start listening for events by starting a single shard of Serenity
