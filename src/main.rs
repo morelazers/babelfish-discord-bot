@@ -96,6 +96,13 @@ impl TypeMapKey for AppConfig {
     type Value = Arc<AppConfig>;
 }
 
+#[derive(Default)]
+struct ReplyTo {
+    message: Option<Message>,
+    message_id: MessageId,
+    author_id: UserId
+}
+
 struct Handler;
 
 #[async_trait]
@@ -109,24 +116,43 @@ impl EventHandler for Handler {
             data.get::<AppConfig>().expect("something").clone()
         };
 
-        println!("Got message from {:?}", msg.author.id);
+        println!("Got message from {:?} ({}): {}", msg.author.id, msg.author.name, msg.content.clone());
         // Don't care about messages from self.
-        if msg.author.id == config.bot_user_id {
+        if is_bot_message(config.bot_user_id, msg.author.id) {
             println!("This is the bot, ignoring.");
             return
         }
+        if !is_monitored_channel(config.aggregate_channel_id, config.source_channel_language.clone(), msg.channel_id.clone()) {
+            println!("This message is in a non-configured channel, ignoring");
+            return
+        }
+
+        // Get a reference to the replied-to message (if any).
+        // how to get an empty message here?
+        let reply_to = get_replied_to_message(msg.clone().referenced_message);
+
+        println!("This is a reply to message {}", reply_to.message_id);
+
+        // If we are posting in the aggregate channel and we are not replying
+        // to anyone, we don't want to make a babelfish message
+
+        if msg.channel_id == config.aggregate_channel_id && reply_to.message_id == 0 {
+            println!("This message in the aggregate channel is not a reply, ignoring.");
+            return;
+        };
 
         // If we have the channel id in the config map, we should get the
         // source language here
-        let mut channel_lang = String::from("en-GB");
+        let channel_lang;
         if config.source_channel_language.contains_key(&msg.channel_id) {
             channel_lang = String::from(config.source_channel_language.get(&msg.channel_id).unwrap());
             println!("Found message in channel {:?} with expected source language {}", msg.channel_id, channel_lang);
-        } else {
+        } else if msg.channel_id != config.aggregate_channel_id {
             println!("The bot is not active in the channel with ID: {}", msg.channel_id);
+            return;
+        } else {
+            channel_lang = config.default_language.clone();
         }
-
-        println!("Got a message in channel {}", &msg.channel_id);
 
         // Get a the thread-safe lock on the translations from the context's data store
         let translations_lock = {
@@ -156,11 +182,17 @@ impl EventHandler for Handler {
         // We may however want to send a Source Bot Reply, so we should check
         // that a little bit later
 
-        // Get a reference to the replied-to message (if any).
-        let reply_to = match msg.referenced_message.clone() {
-            Some(m) => m.id,
-            None => MessageId::from(0)
-        };
+        // If the message we are replying to is an Aggregate Bot Message, then
+        // we are likely to want to send a Source Bot Reply as a result of the
+        // translation.
+
+        // Which means our data structure must contain both the Aggregate Bot
+        // and Source Bot message IDs.
+
+        // Source Message -> Aggregate Bot Message
+        // Source Reply -> Aggregate Bot Reply
+        // Aggregate Message -> Source Bot Message
+        // Aggregate Reply -> Source Bot Reply
 
         println!("This is a reply to message {}", reply_to);
 
@@ -187,13 +219,10 @@ impl EventHandler for Handler {
                 .await;
 
             let referenced_past_translation = all_past_translations
-                .get(&reply_to);
+                .get(&reply_to.message_id);
 
             target_message = match referenced_past_translation {
                 Some(s) => BotMessage {
-                    // Here is where we should be doing some work to find out
-                    // what we have just got a hold of.
-
                     // The target channel ID is the inverse.
                     // Source -> Aggregate
                     // Aggregate -> Source
@@ -205,6 +234,25 @@ impl EventHandler for Handler {
             };
 
         };
+
+        // If the message we are replying to was _not_ written by the bot, we
+        // should be printing this in the aggregate channel, not the source
+        match reply_to.message.clone() {
+            Some(replying_to) => {
+                if
+                    replying_to.id != 0 &&
+                    replying_to.author.id != config.bot_user_id &&
+                    msg.channel_id != config.aggregate_channel_id
+                {
+                    // ideally here we would be replying to the original translation
+                    // in the aggregate_channel, but that's just going to melt my brain
+                    target_message.target_reply_to_message = MessageId::from(0);
+                    target_message.target_channel_id = config.aggregate_channel_id;
+                    target_message.target_language = config.default_language.clone()
+                }
+            },
+            None => {}
+        }
 
         println!("Translating to {}, then sending a message to channel {}", &target_message.target_language, target_message.target_channel_id);
 
@@ -228,35 +276,27 @@ impl EventHandler for Handler {
             println!("Stored the message {:?} with key {}", past_translation.clone(), msg.id.clone());
         };
 
-
-        // No translation necessary - already source language
-        if translation.text.eq("") || translation.text == msg.content {
-            return
-        }
+        let from_name = match msg.clone().author_nick(&ctx.http).await {
+            Some(_nickname) => _nickname,
+            None => msg.clone().author.name
+        };
 
         let sent_message_result = target_message.target_channel_id.send_message(&ctx.http, |f| {
 
-            let mut msg_ref = MessageReference::from(&msg);
-
-            // Here lies some code which conditionally attaches  the bot's reply
-            // to either the just-translated message, or the message which was
-            // replied-to by said message (whose language we have just
-            // translated back into).
-            // Not sure whether this is too confusing or not though, and you
-            // loee the "audit trail"
-            if reply_to != 0 {
-                println!("This message is a reply to {} in the channel {}", target_message.target_reply_to_message, target_message.target_channel_id);
-                msg_ref = MessageReference::from((target_message.target_channel_id, target_message.target_reply_to_message));
-            }
-
-            // We want to reply to a message if: this is the channel that the
-            // original message was typed in. So if the message we're sending
-            // right now is a return translation
-            let content = format!("{} (from: {})", translation.text, msg.clone().author.name);
+            let content = format!("{} (from: {})", translation.text, from_name);
             let mut message_builder = f.content(content);
-            if reply_to != 0 {
+
+            // If `msg` is a reply TO A BOT MESSAGE, we want to attach the built
+            // message to something
+            if
+                reply_to.message_id != 0 &&
+                is_bot_message(config.bot_user_id, reply_to.author_id)
+            {
+                println!("This message is a reply to {} in the channel {}", target_message.target_reply_to_message, target_message.target_channel_id);
+                let msg_ref = MessageReference::from((target_message.target_channel_id, target_message.target_reply_to_message));
                 message_builder = message_builder.reference_message(msg_ref);
             }
+
             message_builder
         }).await;
 
@@ -315,6 +355,32 @@ pub async fn translate_message (msg: String, language_code: String, api_key: &St
     }
     first_translation.clone()
 
+}
+
+fn is_bot_message(bot_id: UserId, message_author_id: UserId) -> bool {
+    bot_id == message_author_id
+}
+
+fn is_monitored_channel(agg_channel_id: ChannelId, source_channel_list: HashMap<ChannelId, String>, msg_channel_id: ChannelId) -> bool {
+    msg_channel_id == agg_channel_id || source_channel_list.contains_key(&msg_channel_id)
+}
+
+fn get_replied_to_message(msg: Option<Box<Message>>) -> ReplyTo {
+    match msg {
+        Some(m) => {
+            let msg = *m.clone();
+            ReplyTo {
+                message: Option::Some(msg.clone()),
+                message_id: msg.clone().id,
+                author_id: msg.clone().author.id
+            }
+        },
+        None => ReplyTo {
+            message: Option::None,
+            message_id: MessageId::from(0),
+            author_id: UserId::from(0)
+        }
+    }
 }
 
 #[actix_rt::main]
