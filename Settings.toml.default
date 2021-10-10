@@ -1,0 +1,6 @@
+bot_token = "XXX"
+deepl_api_key = "YYY"
+aggregate_channel_id = 12345
+source_channel_language = {123456 = "DE", 654321 = "ES"}
+default_language = "en-GB"
+bot_user_id = 0987654

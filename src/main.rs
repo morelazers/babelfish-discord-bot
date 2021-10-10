@@ -194,6 +194,20 @@ impl EventHandler for Handler {
         // Aggregate Message -> Source Bot Message
         // Aggregate Reply -> Source Bot Reply
 
+        println!("This is a reply to message {}", reply_to);
+
+        // If the message we are replying to is an Aggregate Bot Message, then
+        // we are likely to want to send a Source Bot Reply as a result of the
+        // translation.
+
+        // Which means our data structure must contain both the Aggregate Bot
+        // and Source Bot message IDs.
+
+        // Source Message -> Aggregate Bot Message
+        // Source Reply -> Aggregate Bot Reply
+        // Aggregate Message -> Source Bot Message
+        // Aggregate Reply -> Source Bot Reply
+
         // Now we need to find out if the replied-to message has been translated
         // already. If it has, we'll translate back to its source language.
         // To do this, we need to activate our read lock on the data, then use
@@ -218,6 +232,7 @@ impl EventHandler for Handler {
                 },
                 None => target_message
             };
+
         };
 
         // If the message we are replying to was _not_ written by the bot, we
