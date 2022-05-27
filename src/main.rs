@@ -194,7 +194,7 @@ impl EventHandler for Handler {
         // Aggregate Message -> Source Bot Message
         // Aggregate Reply -> Source Bot Reply
 
-        println!("This is a reply to message {}", reply_to);
+        println!("This is a reply to message {}", reply_to.message_id);
 
         // If the message we are replying to is an Aggregate Bot Message, then
         // we are likely to want to send a Source Bot Reply as a result of the
@@ -222,13 +222,23 @@ impl EventHandler for Handler {
                 .get(&reply_to.message_id);
 
             target_message = match referenced_past_translation {
-                Some(s) => BotMessage {
-                    // The target channel ID is the inverse.
-                    // Source -> Aggregate
-                    // Aggregate -> Source
-                    target_channel_id: s.channel_id,
-                    target_language: s.language.clone(),
-                    target_reply_to_message: s.message_id
+                Some(s) => {
+                    let mut bot_message_to_send = BotMessage {
+                        // The target channel ID is the inverse.
+                        // Source -> Aggregate
+                        // Aggregate -> Source
+                        target_channel_id: s.channel_id,
+                        target_language: s.language.clone(),
+                        target_reply_to_message: s.message_id
+                    };
+                    // If this message is a reply to another message in the Source Channel,
+                    // then we should post the message into the aggregate channel as a reply
+                    // to the message which resulted from the original translation.
+                    if reply_to.message_id != 0 && msg.channel_id != config.aggregate_channel_id && referenced_past_translation.is_some() {
+                        println!("This message is a reply to a message in the Source Channel, posting as a reply to the original message.");
+                        bot_message_to_send.target_reply_to_message = MessageId::from(reply_to.message_id);
+                    }
+                    bot_message_to_send
                 },
                 None => target_message
             };
@@ -266,7 +276,7 @@ impl EventHandler for Handler {
         let past_translation = PastTranslation {
             language: channel_lang.clone(),
             channel_id: msg.channel_id,
-            message_id: msg.id
+            message_id: msg.id,
         };
 
         // Now write this message's id to storage, keying its source language
@@ -283,7 +293,7 @@ impl EventHandler for Handler {
 
         let sent_message_result = target_message.target_channel_id.send_message(&ctx.http, |f| {
 
-            let content = format!("{} (from: {})", translation.text, from_name);
+            let content = format!("{} (from: {} in {})", translation.text, from_name, channel_lang);
             let mut message_builder = f.content(content);
 
             // If `msg` is a reply TO A BOT MESSAGE, we want to attach the built
