@@ -242,7 +242,6 @@ impl EventHandler for Handler {
                 },
                 None => target_message
             };
-
         };
 
         // If the message we are replying to was _not_ written by the bot, we
@@ -320,7 +319,7 @@ impl EventHandler for Handler {
             {
                 let mut translations = translations_lock.write().await;
                 let translation = PastTranslation {
-                    language: translation.detected_source_language.clone(),
+                    language: channel_lang.clone(),
                     channel_id: msg.channel_id,
                     message_id: msg.id
                 };
