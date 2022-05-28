@@ -234,9 +234,9 @@ impl EventHandler for Handler {
                     // If this message is a reply to another message in the Source Channel,
                     // then we should post the message into the aggregate channel as a reply
                     // to the message which resulted from the original translation.
-                    if reply_to.message_id != 0 && msg.channel_id != config.aggregate_channel_id && referenced_past_translation.is_some() {
+                    if reply_to.message_id != 0 && s.channel_id != config.aggregate_channel_id {
                         println!("This message is a reply to a message in the Source Channel, posting as a reply to the original message.");
-                        bot_message_to_send.target_reply_to_message = MessageId::from(reply_to.message_id);
+                        bot_message_to_send.target_reply_to_message = MessageId::from(s.message_id);
                     }
                     bot_message_to_send
                 },
